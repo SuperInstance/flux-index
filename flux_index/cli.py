@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
 """
-flux-index CLI — semantic code search from the command line.
+flux-index — Semantic code search, zero dependencies.
 
 Usage:
     flux-index .                          # index current directory
     flux-index /path/to/repo              # index a repo
     flux-index search "auth flow"         # search indexed repo
-    flux-index search --all "auth flow"   # search all indexed repos
+    flux-index search --all "auth flow"   # search all known repos
     flux-index map                        # show codebase map
-    flux-index status                     # show index status
 """
 
-import sys
-import os
-import argparse
+import sys, os, argparse
 from pathlib import Path
 
-# Add parent to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from flux_index.extractor import repo_to_vectors, search_repo
+from flux_index.core import Index, Tile, SearchResult, extract_repo, index_repo
 
 
-def find_index(path="."):
-    """Find .flux.fvt file in or above current directory."""
+def _find_index(path="."):
+    """Find .flux.fvt in or above current directory."""
     p = Path(path).resolve()
     while p != p.parent:
         fvt = p / ".flux.fvt"
@@ -33,195 +27,219 @@ def find_index(path="."):
     return None
 
 
-def find_all_indexes():
-    """Find all .flux.fvt files in common locations."""
+def _find_all_indexes():
+    """Find all indexed repos."""
     indexes = []
-    # Check ~/.flux-index/
-    home_idx = Path.home() / ".flux-index"
-    if home_idx.exists():
-        for fvt in home_idx.glob("*.fvt"):
+    # Home index directory
+    home = Path.home() / ".flux-index"
+    if home.exists():
+        indexes.extend(str(f) for f in home.glob("*.fvt"))
+    # Walk up from cwd
+    idx = _find_index()
+    if idx and idx not in indexes:
+        indexes.append(idx)
+    # Scan /tmp for other indexed repos
+    for fvt in Path("/tmp").rglob(".flux.fvt"):
+        if str(fvt) not in indexes:
             indexes.append(str(fvt))
-    # Check current directory tree
-    for fvt in Path(".").rglob(".flux.fvt"):
-        indexes.append(str(fvt))
     return indexes
 
 
+def _print_results(results: list, repo_name: str = "", max_width: int = 90):
+    """Pretty-print search results."""
+    if not results:
+        print("  No results.")
+        return
+    
+    prefix = f"  {repo_name}/" if repo_name else "  /"
+    for r in results:
+        t = r.tile
+        # Format: [score] type: name (path:line)
+        loc = f"{t.path}"
+        if t.line:
+            loc += f":{t.line}"
+        header = f"[{r.score:.3f}] {t.type}: {t.name} ({loc})"
+        
+        # Show a one-line snippet from content (first non-empty line after declaration)
+        snippet = ""
+        for line in t.content.split("\n")[1:4]:
+            stripped = line.strip()
+            if stripped and not stripped.startswith(('"""', "'''")):
+                snippet = stripped[:max_width]
+                break
+        
+        print(f"{prefix}{header}")
+        if snippet:
+            print(f"{' ' * len(prefix)}  {snippet}")
+
+
 def cmd_index(args):
-    """Index a repository."""
-    path = args.path
+    path = os.path.abspath(args.path)
     if not os.path.exists(path):
         print(f"Error: {path} does not exist")
         return 1
     
     output = args.output or os.path.join(path, ".flux.fvt")
     
-    print(f"Indexing {path}...")
-    stats = repo_to_vectors(
-        path,
-        output_path=output,
-        dim=args.dim,
-        max_commits=args.commits,
-    )
+    print(f"📂 Indexing {path}...")
+    stats = index_repo(path, output, dim=args.dim, max_commits=args.commits)
     
-    print(f"\n  Tiles extracted: {stats['tiles_extracted']}")
-    print(f"  Types: {stats['type_breakdown']}")
-    if stats['language_breakdown']:
-        print(f"  Languages: {stats['language_breakdown']}")
-    print(f"  Index size: {stats['output_size_kb']:.0f} KB")
-    print(f"  Saved to: {stats['output_path']}")
-    print(f"\n  Search it: flux-index search \"your query here\"")
+    print(f"\n  ✅ {stats['tiles']} tiles indexed")
+    for t, c in sorted(stats["types"].items(), key=lambda x: -x[1]):
+        print(f"     {t}: {c}")
+    if stats["languages"]:
+        langs = ", ".join(f"{k} ({v})" for k, v in sorted(stats["languages"].items(), key=lambda x: -x[1]))
+        print(f"     Languages: {langs}")
+    print(f"     Size: {stats['size_kb']:.0f} KB → {stats['output']}")
+    print(f"\n  🔍 Search: flux-index search \"your query here\"")
     return 0
 
 
 def cmd_search(args):
-    """Search an indexed repository."""
+    query = " ".join(args.query)
+    
     if args.all:
-        indexes = find_all_indexes()
+        indexes = _find_all_indexes()
         if not indexes:
             print("No indexed repos found. Run 'flux-index .' first.")
             return 1
     else:
-        idx = find_index()
+        idx = _find_index()
         if not idx:
-            # Try current directory name in ~/.flux-index/
-            name = Path(".").resolve().name
-            fallback = str(Path.home() / ".flux-index" / f"{name}.fvt")
-            if os.path.exists(fallback):
-                idx = fallback
-            else:
-                print("No index found. Run 'flux-index .' first.")
-                return 1
+            print("No index found. Run 'flux-index .' first.")
+            return 1
         indexes = [idx]
     
-    query = " ".join(args.query)
-    
+    total_results = 0
     for fvt_path in indexes:
         repo_name = Path(fvt_path).stem.replace(".flux", "")
+        idx = Index()
         try:
-            results = search_repo(fvt_path, query, top_k=args.top)
+            idx.load(fvt_path)
         except Exception as e:
-            print(f"  {repo_name}: error loading index ({e})")
+            print(f"  ⚠ {repo_name}: failed to load ({e})")
             continue
         
+        results = idx.search(query, top_k=args.top, min_score=0.3)
         if results:
-            print(f"\n  {repo_name}/")
-            for entry, score in results:
-                # Truncate snippet for display
-                snippet = entry.snippet.replace("\n", " ")[:100]
-                print(f"    [{score:.3f}] {snippet}")
+            print(f"\n  📦 {repo_name}/")
+            _print_results(results, max_width=80)
+            total_results += len(results)
+    
+    if total_results == 0:
+        print(f"\n  No results for \"{query}\"")
+        print("  Try broader terms, or index more repos with 'flux-index <path>'")
     
     return 0
 
 
 def cmd_map(args):
-    """Show a map of the indexed codebase."""
-    idx = find_index()
+    idx = _find_index()
     if not idx:
         print("No index found. Run 'flux-index .' first.")
         return 1
     
-    from flux_index.search import FluxVectorTwin
-    twin = FluxVectorTwin()
-    twin.load(idx)
+    index = Index()
+    index.load(idx)
     
-    print(f"Codebase: {Path(idx).parent.name}")
-    print(f"Tiles: {twin.count}")
-    print(f"Dimensions: {twin.dim}")
-    print()
+    repo_name = Path(idx).parent.name
+    print(f"📦 {repo_name}")
+    print(f"   Tiles: {index.count}")
     
-    # Group by type
-    from collections import Counter
-    types = Counter()
-    for entry in twin.entries:
-        # Extract type from snippet
-        if entry.snippet.startswith("function:"):
-            types["function"] += 1
-        elif entry.snippet.startswith("class:"):
-            types["class"] += 1
-        elif entry.snippet.startswith("struct:"):
-            types["struct"] += 1
-        elif entry.snippet.startswith("commit:"):
-            types["commit"] += 1
-        elif entry.snippet.startswith("readme:"):
-            types["readme"] += 1
-        else:
-            types["file"] += 1
-    
-    print("Breakdown:")
+    types = Counter(t.type for t in index.tiles)
     for t, c in types.most_common():
-        print(f"  {t}: {c}")
+        bar = "█" * min(c, 40)
+        print(f"   {t:10s} {c:4d} {bar}")
+    
+    # Show top functions/classes by name
+    functions = [t for t in index.tiles if t.type in ("function", "class", "struct")]
+    if functions:
+        print(f"\n   Key symbols:")
+        for t in functions[:20]:
+            print(f"     {t.type}: {t.name} ({t.path}:{t.line})")
+        if len(functions) > 20:
+            print(f"     ... and {len(functions) - 20} more")
     
     return 0
 
 
-def cmd_status(args):
-    """Show index status."""
-    idx = find_index()
-    if idx:
-        size = os.path.getsize(idx) / 1024
-        print(f"Index: {idx} ({size:.0f} KB)")
-    else:
-        print("No index in current directory tree.")
+def cmd_similar(args):
+    """Find code similar to a given tile."""
+    idx_path = _find_index()
+    if not idx_path:
+        print("No index found.")
+        return 1
     
-    # Check home indexes
-    home_idx = Path.home() / ".flux-index"
-    if home_idx.exists():
-        fvts = list(home_idx.glob("*.fvt"))
-        if fvts:
-            print(f"\nHome indexes ({len(fvts)}):")
-            for fvt in fvts:
-                size = os.path.getsize(fvt) / 1024
-                print(f"  {fvt.stem}: {size:.0f} KB")
+    index = Index()
+    index.load(idx_path)
+    query = " ".join(args.query)
+    
+    # First search for the target
+    results = index.search(query, top_k=1)
+    if not results:
+        print(f"Nothing found for \"{query}\"")
+        return 1
+    
+    target = results[0].tile
+    print(f"Finding code similar to: {target.type}: {target.name} ({target.path}:{target.line})")
+    
+    # Search using the target's content as query
+    similar = index.search(target.content, top_k=args.top + 1)
+    for r in similar:
+        if r.tile.id != target.id:
+            print(f"  [{r.score:.3f}] {r.tile.type}: {r.tile.name} ({r.tile.path}:{r.tile.line})")
     
     return 0
+
+
+from collections import Counter
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="flux-index — Semantic code search, zero dependencies",
         prog="flux-index",
+        description="flux-index — Semantic code search, zero dependencies",
     )
-    subparsers = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(dest="command")
     
-    # index
-    p_index = subparsers.add_parser("index", help="Index a repository")
-    p_index.add_argument("path", help="Path to repository")
-    p_index.add_argument("-o", "--output", help="Output .fvt file path")
-    p_index.add_argument("--dim", type=int, default=64, help="Embedding dimensions")
-    p_index.add_argument("--commits", type=int, default=200, help="Max commits to index")
-    p_index.set_defaults(func=cmd_index)
+    # index (default if just a path)
+    p_idx = sub.add_parser("index", help="Index a repository")
+    p_idx.add_argument("path", help="Path to repository")
+    p_idx.add_argument("-o", "--output", help="Output .fvt path")
+    p_idx.add_argument("--dim", type=int, default=128, help="Embedding dimensions")
+    p_idx.add_argument("--commits", type=int, default=200, help="Max commits to index")
+    p_idx.set_defaults(func=cmd_index)
     
     # search
-    p_search = subparsers.add_parser("search", help="Search indexed repository")
+    p_search = sub.add_parser("search", help="Search indexed code")
     p_search.add_argument("query", nargs="+", help="Search query")
     p_search.add_argument("--all", action="store_true", help="Search all indexed repos")
-    p_search.add_argument("--top", type=int, default=10, help="Number of results")
+    p_search.add_argument("--top", type=int, default=5, help="Results per repo")
     p_search.set_defaults(func=cmd_search)
     
     # map
-    p_map = subparsers.add_parser("map", help="Show codebase map")
+    p_map = sub.add_parser("map", help="Show codebase map")
     p_map.set_defaults(func=cmd_map)
     
-    # status
-    p_status = subparsers.add_parser("status", help="Show index status")
-    p_status.set_defaults(func=cmd_status)
+    # similar
+    p_sim = sub.add_parser("similar", help="Find similar code")
+    p_sim.add_argument("query", nargs="+", help="Reference query")
+    p_sim.add_argument("--top", type=int, default=5, help="Number of results")
+    p_sim.set_defaults(func=cmd_similar)
     
-    # Default: if just a path, index it
-    if len(sys.argv) > 1 and not sys.argv[1].startswith("-") and sys.argv[1] not in ("search", "map", "status", "index"):
-        # Treat as: flux-index /path/to/repo
+    # Default: if first arg is a directory, index it
+    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
         args = argparse.Namespace(
             command="index", path=sys.argv[1],
-            output=None, dim=64, commits=200, func=cmd_index,
+            output=None, commits=200, dim=128, func=cmd_index,
         )
     else:
         args = parser.parse_args()
     
     if hasattr(args, "func"):
         return args.func(args)
-    else:
-        parser.print_help()
-        return 1
+    parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":

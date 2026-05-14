@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 flux_index/__init__.py
 flux_index/cli.py
+flux_index/core.py
 flux_index/extractor.py
 flux_index/search.py
 flux_index.egg-info/PKG-INFO
