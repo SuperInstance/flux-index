@@ -1,0 +1,2 @@
+[console_scripts]
+flux-index = flux_index.cli:main
