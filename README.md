@@ -174,3 +174,10 @@ The developer tool that respects your code by keeping it local.
 ---
 
 *"The lattice doesn't care what language you wrote in. It just knows what sounds like what."*
+
+## Related from the wider fleet (May 2026)
+
+PLATO-NG's Loop Room architecture (everything is a loop or a single run)
+and the conservation law (γ+H = 1.283 - 0.159·log(V)) govern all room state.
+The perpetual daemon pattern ensures continuous operation.
+See https://github.com/SuperInstance/plato-ng for the full framework.
