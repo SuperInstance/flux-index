@@ -8,7 +8,7 @@ single .fvt (FLUX Vector Twin) file.
 Query time: 0.1ms across the entire repo's knowledge.
 
 Usage:
-    from repo_to_vectors import repo_to_vectors
+    from flux_index.extractor import repo_to_vectors
     repo_to_vectors("SuperInstance/plato-training", token="gho_...")
     # → .fvt file ready for instant search
 """
@@ -20,10 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from collections import Counter
 
-# Re-use the embedding infrastructure
-import sys
-sys.path.insert(0, str(Path.home() / ".openclaw" / "workspace" / ".local-plato"))
-from flux_vector_twin import FluxVectorTwin, text_to_embedding, VectorEntry
+from flux_index.core import Index, Tile, Embedder
 
 
 # ─── Extraction: what counts as a "tile" in a repo ────────────────
@@ -236,6 +233,22 @@ def extract_readme(repo_path: str) -> Optional[RepoTile]:
     return None
 
 
+# ─── Convert RepoTiles to core.Tiles ──────────────────────────────
+
+def _repo_tile_to_tile(rt: RepoTile) -> Tile:
+    """Convert a RepoTile extraction result to a core.Tile for indexing."""
+    return Tile(
+        id=f"{rt.tile_type}:{rt.path}:{rt.name}",
+        type=rt.tile_type, path=rt.path, name=rt.name,
+        content=rt.content[:2000], language=rt.language,
+        line=rt.line_start,
+        metadata={
+            "line_end": rt.line_end,
+            **rt.metadata,
+        },
+    )
+
+
 # ─── Main: repo → vector space ────────────────────────────────────
 
 def repo_to_vectors(
@@ -309,31 +322,15 @@ def repo_to_vectors(
     commits = extract_commits(repo_path, max_commits)
     all_tiles.extend(commits)
     
-    # Build vector twin
-    twin = FluxVectorTwin(dim=dim)
+    # Build index
+    idx = Index(dim=dim)
     
-    # Convert RepoTiles to indexable entries
-    # We abuse the Tile dataclass from local_plato
-    from local_plato import Tile
-    plato_tiles = []
-    for i, rt in enumerate(all_tiles):
-        text = f"{rt.tile_type}: {rt.name}\n{rt.content}"
-        plato_tiles.append(Tile(
-            tile_id=f"{repo_name}:{rt.tile_type}:{i}",
-            room=repo_name,
-            domain=rt.path,
-            question=f"{rt.tile_type}: {rt.name} ({rt.path})",
-            answer=rt.content[:2000],
-            source="repo-extractor",
-            tags=[rt.tile_type, rt.language] if rt.language else [rt.tile_type],
-            timestamp=rt.metadata.get("ts", 0),
-        ))
-    
-    # Index
-    indexed = twin.index_tiles(plato_tiles)
+    # Convert RepoTiles to core.Tiles and index
+    core_tiles = [_repo_tile_to_tile(rt) for rt in all_tiles]
+    idx.add(core_tiles)
     
     # Save
-    twin.save(output_path)
+    idx.save(output_path)
     
     # Stats
     type_counts = Counter(t.tile_type for t in all_tiles)
@@ -342,7 +339,7 @@ def repo_to_vectors(
     return {
         "repo": repo_name,
         "tiles_extracted": len(all_tiles),
-        "tiles_indexed": indexed,
+        "tiles_indexed": len(core_tiles),
         "type_breakdown": dict(type_counts),
         "language_breakdown": dict(lang_counts),
         "output_path": output_path,
@@ -350,32 +347,33 @@ def repo_to_vectors(
     }
 
 
-def search_repo(fvt_path: str, query: str, top_k: int = 10) -> List[Tuple[VectorEntry, float]]:
+def search_repo(fvt_path: str, query: str, top_k: int = 10) -> List:
     """
     Search a spring-loaded repo. Loads .fvt, runs semantic search.
     
     This is the "throwing the dart" — the repo was pre-loaded,
     now you query it in ~0.1ms.
+    
+    Returns list of (SearchResult) objects with .tile and .score attributes.
     """
-    twin = FluxVectorTwin()
-    twin.load(fvt_path)
-    return twin.search(query, top_k=top_k)
+    idx = Index()
+    idx.load(fvt_path)
+    return idx.search(query, top_k=top_k)
 
 
 def repo_report(fvt_path: str) -> str:
     """Human-readable summary of a spring-loaded repo."""
-    twin = FluxVectorTwin()
-    twin.load(fvt_path)
+    idx = Index()
+    idx.load(fvt_path)
     
     lines = [
         f"=== REPO VECTOR REPORT: {Path(fvt_path).stem} ===",
-        f"Tiles: {twin.count}",
-        f"Dimensions: {twin.dim}",
-        f"IDF features: {len(twin.idf_weights)}",
+        f"Tiles: {idx.count}",
+        f"IDF features: {len(idx.embedder.idf)}",
         f"",
         "Sample entries:",
     ]
-    for entry in twin.entries[:10]:
-        lines.append(f"  [{entry.room}] {entry.snippet[:80]}")
+    for tile in idx.tiles[:10]:
+        lines.append(f"  [{tile.type}] {tile.name} ({tile.path})")
     
     return "\n".join(lines)
